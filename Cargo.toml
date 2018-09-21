@@ -1,0 +1,7 @@
+[workspace]
+members = ["asl-runtime", "asl-capi", "asl-lang", "asl-lang-cli", "asl-lang-capi"]
+exclude = ["asl-rust-example", "asl-derive"]
+
+[profile.release]
+panic = "abort"
+lto = true

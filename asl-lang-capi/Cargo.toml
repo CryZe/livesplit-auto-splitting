@@ -1,0 +1,11 @@
+[package]
+name = "asl-lang-capi"
+version = "0.1.0"
+authors = ["Christopher Serr <christopher.serr@gmail.com>"]
+
+[dependencies]
+asl-lang = { path = "../asl-lang" }
+
+[lib]
+name = "asl_lang"
+crate-type = ["staticlib", "cdylib"]

@@ -1,0 +1,15 @@
+[package]
+name = "asl-rust-example"
+version = "0.1.0"
+authors = ["Christopher Serr <christopher.serr@gmail.com>"]
+
+[dependencies]
+asl-derive = { path = "../asl-derive" }
+
+[lib]
+name = "asl"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+panic = "abort"

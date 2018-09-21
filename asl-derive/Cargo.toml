@@ -1,0 +1,11 @@
+[package]
+name = "asl-derive"
+version = "0.1.0"
+authors = ["Christopher Serr <christopher.serr@gmail.com>"]
+
+[dependencies]
+syn = "0.14.6"
+quote = "0.6.4"
+
+[lib]
+proc-macro = true

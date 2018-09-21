@@ -1,0 +1,11 @@
+[package]
+name = "asl-capi"
+version = "0.1.0"
+authors = ["Christopher Serr <christopher.serr@gmail.com>"]
+
+[dependencies]
+asl-runtime = { path = "../asl-runtime" }
+
+[lib]
+name = "asl"
+crate-type = ["staticlib", "cdylib"]

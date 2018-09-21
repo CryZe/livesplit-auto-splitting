@@ -1,0 +1,986 @@
+use std::str::FromStr;
+use code_gen::{Op, CodeGenDesc};
+use name_resolution::{DeclaredBy, VarNames, VarDecl, Vars, FunctionParamAsVar};
+use types::{self, Inference, TypeChecking, Ty};
+use ast::{self, Children, Scoped};
+use specs::prelude::*;
+use ops::{unary_op, bin_op, bin_op_extend, build_compare, build_op_assign, build_action, build_fn};
+use reg_extend::{NeedsExtending, InferExtending, ExtendConnection};
+use debug_info::{SrcByteRange, ReferencesVar};
+use function_signatures::FunctionCall;
+
+grammar<'world>(world: &'world mut World);
+
+pub Source: ast::Source = <items:Item*> => ast::Source { items };
+
+Item: ast::Item = {
+    <state:State> => ast::Item::State(state),
+    Action,
+    Function,
+};
+
+State: ast::State = "state" "(" <process:StrLit> ")" "{" <paths:PointerPath*> "}" => ast::State { process, paths };
+
+PointerPath: ast::PointerPath = <name:Ident> ":" <ty:KnownTy> "=" <module:StrLit> "," <offsets:Offsets> ";" => ast::PointerPath {
+    name,
+    ty,
+    module,
+    offsets,
+};
+
+Offsets: Vec<i64> = {
+    <offsets:Offsets> "," <offset:IntLit> => {
+        let mut offsets = offsets;
+        offsets.push(offset);
+        offsets
+    },
+    <offset:IntLit> => vec![offset],
+};
+
+Action: ast::Item = {
+    <ls:@L> "start" <block:Block> <rs:@R> => build_action(world, ast::ActionKind::Start, Ty::Bool, block, (ls, rs)),
+    <ls:@L> "split" <block:Block> <rs:@R> => build_action(world, ast::ActionKind::Split, Ty::Bool, block, (ls, rs)),
+    <ls:@L> "reset" <block:Block> <rs:@R> => build_action(world, ast::ActionKind::Reset, Ty::Bool, block, (ls, rs)),
+    <ls:@L> "isLoading" <block:Block> <rs:@R> => build_action(world, ast::ActionKind::IsLoading, Ty::Bool, block, (ls, rs)),
+    <ls:@L> "gameTime" <block:Block> <rs:@R> => build_action(world, ast::ActionKind::GameTime, Ty::F64, block, (ls, rs)),
+};
+
+Function: ast::Item = {
+    "fn" <ls:@L> <name:Ident> <rs:@R> <params:FnParams> <block:Block> => build_fn(world, name, params, None, block, (ls, rs)),
+    "fn" <ls:@L> <name:Ident> <rs:@R> <params:FnParams> "->" <ty:Ty> <block:Block> => build_fn(world, name, params, ty, block, (ls, rs)),
+};
+
+FnParams: Vec<(String, Option<Ty>, SrcByteRange)> = {
+    "(" ")" => Vec::new(),
+    "(" <params:FnParamsInner> ","? ")" => params,
+};
+
+FnParamsInner: Vec<(String, Option<Ty>, SrcByteRange)> = {
+    <params:FnParamsInner> "," <param:FnParam> => {
+        let mut params = params;
+        params.push(param);
+        params
+    },
+    <param:FnParam> => vec![param],
+};
+
+FnParam: (String, Option<Ty>, SrcByteRange) = {
+    <ls:@L> <name:Ident> <rs:@R> => (name, None, SrcByteRange(ls, rs)),
+    <ls:@L> <name:Ident> <rs:@R> ":" <ty:Ty> => (name, ty, SrcByteRange(ls, rs)),
+};
+
+Block: Entity = {
+    <ls:@L> "{" "}" <rs:@R> => world.create_entity()
+        .with(Ty::Unit)
+        .with(CodeGenDesc(vec![]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> "{" <statements:Statements> "}" <rs:@R> => world.create_entity()
+        .with(CodeGenDesc(statements.iter().cloned().map(Op::Entity).collect()))
+        .with(Children(statements))
+        .with(Scoped)
+        .with(Ty::Unit)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> "{" <statements:Statements> <expr:Expr> "}" <rs:@R> => world.create_entity()
+        .with(CodeGenDesc({
+            let mut instructions = statements
+                .iter()
+                .cloned()
+                .map(Op::Entity)
+                .collect::<Vec<_>>();
+            instructions.push(Op::Entity(expr));
+            instructions
+        }))
+        .with(Children({
+            let mut children = statements;
+            children.push(expr);
+            children
+        }))
+        .with(Scoped)
+        .with(TypeChecking(vec![Inference::SameAsMe(expr)]))
+        .with(InferExtending(vec![ExtendConnection::FromEntity(expr)]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> "{" <expr:Expr> "}" <rs:@R> => world.create_entity()
+        .with(CodeGenDesc(vec![Op::Entity(expr)]))
+        .with(Children(vec![expr]))
+        .with(Scoped)
+        .with(TypeChecking(vec![Inference::SameAsMe(expr)]))
+        .with(InferExtending(vec![ExtendConnection::FromEntity(expr)]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+};
+
+Statements: Vec<Entity> = {
+    <statements:Statements> <statement:Statement> => {
+        let mut statements = statements;
+        statements.push(statement);
+        statements
+    },
+    <statement:Statement> => vec![statement],
+};
+
+Statement: Entity = {
+    DeclStmt,
+    AssignStmt,
+    ExprStmt,
+};
+
+DeclStmt: Entity = {
+     "let" <l:@L> <name:Ident> <r:@R> "=" <expr:Expr> ";" => world.create_entity()
+        .with(Children(vec![expr]))
+        .with(VarNames(vec![name]))
+        .with(VarDecl(0))
+        .with(ReferencesVar(0))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(expr),
+            Inference::VarSameAsMe(0),
+        ]))
+        .with(CodeGenDesc(vec![
+            Op::Entity(expr),
+            Op::StoreVar(0),
+        ]))
+        .with(InferExtending(vec![
+            ExtendConnection::FromEntity(expr),
+            ExtendConnection::StoreVar(0),
+        ]))
+        .with(SrcByteRange(l, r))
+        .build(),
+
+    "let" <l:@L> <name:Ident> <r:@R> ":" <ty:Ty> "=" <expr:Expr> ";" => {
+        let mut builder = world.create_entity()
+            .with(Children(vec![expr]))
+            .with(VarNames(vec![name]))
+            .with(VarDecl(0))
+            .with(ReferencesVar(0))
+            .with(TypeChecking(vec![
+                Inference::SameAsMe(expr),
+                Inference::VarSameAsMe(0),
+            ]))
+            .with(CodeGenDesc(vec![
+                Op::Entity(expr),
+                Op::StoreVar(0),
+            ]))
+            .with(InferExtending(vec![
+                ExtendConnection::FromEntity(expr),
+                ExtendConnection::StoreVar(0),
+            ]))
+            .with(SrcByteRange(l, r));
+
+        if let Some(ty) = ty {
+            builder = builder.with(ty);
+        }
+
+        builder.build()
+    },
+};
+
+AssignStmt: Entity = {
+    <l:@L> <name:Ident> <r:@R> "=" <expr:Expr> ";" => world.create_entity()
+        .with(Children(vec![expr]))
+        .with(VarNames(vec![name]))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(expr),
+            Inference::VarSameAsMe(0),
+        ]))
+        .with(CodeGenDesc(vec![
+            Op::Entity(expr),
+            Op::StoreVar(0),
+        ]))
+        .with(InferExtending(vec![
+            ExtendConnection::FromEntity(expr),
+            ExtendConnection::StoreVar(0),
+        ]))
+        .with(ReferencesVar(0))
+        .with(SrcByteRange(l, r))
+        .build(),
+
+    <l:@L> <name:Ident> <r:@R> "+=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::Add, Ty::Number, false, true),
+    <l:@L> <name:Ident> <r:@R> "-=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::Sub, Ty::Number, true, true),
+    <l:@L> <name:Ident> <r:@R> "*=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::Mul, Ty::Number, false, true),
+    <l:@L> <name:Ident> <r:@R> "/=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::Div, Ty::Number, true, false),
+    <l:@L> <name:Ident> <r:@R> "|=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::BitOr, Ty::Bits, false, false),
+    <l:@L> <name:Ident> <r:@R> "^=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::Xor, Ty::Bits, false, false),
+    <l:@L> <name:Ident> <r:@R> "&=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::BitAnd, Ty::Bits, false, false),
+    <l:@L> <name:Ident> <r:@R> "<<=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::LShift, Ty::Int, false, true),
+    // TODO No need to extend the shift count, and only infer extend from lhs
+    <l:@L> <name:Ident> <r:@R> ">>=" <expr:Expr> ";" => build_op_assign(world, (name, l, r), expr, Op::RShift, Ty::Int, true, false),
+};
+
+ExprStmt: Entity = {
+    <expr:Expr> ";" => world.create_entity()
+        .with(Children(vec![expr]))
+        .with(CodeGenDesc(vec![
+            Op::Entity(expr),
+            Op::Drop,
+        ]))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(expr),
+        ]))
+        .build(),
+};
+
+Expr: Entity = BoolOr;
+
+BoolOr: Entity = {
+    <ls:@L> <l:BoolOr> "||" <r:BoolAnd> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::BoolOr))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Bool)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    BoolAnd,
+};
+
+BoolAnd: Entity = {
+    <ls:@L> <l:BoolAnd> "&&" <r:Compare> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::BoolAnd))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Bool)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    Compare,
+};
+
+Compare: Entity = {
+    <ls:@L> <l:BitOr> "==" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Eq, None, SrcByteRange(ls, rs)),
+    <ls:@L> <l:BitOr> "!=" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Ne, None, SrcByteRange(ls, rs)),
+    <ls:@L> <l:BitOr> ">" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Gt, Some(Ty::Number), SrcByteRange(ls, rs)),
+    <ls:@L> <l:BitOr> ">=" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Ge, Some(Ty::Number), SrcByteRange(ls, rs)),
+    <ls:@L> <l:BitOr> "<" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Lt, Some(Ty::Number), SrcByteRange(ls, rs)),
+    <ls:@L> <l:BitOr> "<=" <r:BitOr> <rs:@R> => build_compare(world, l, r, Op::Le, Some(Ty::Number), SrcByteRange(ls, rs)),
+    BitOr,
+};
+
+BitOr: Entity = {
+    <ls:@L> <l:BitOr> "|" <r:Xor> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::BitOr))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Bits)
+        .with(InferExtending(vec![
+            ExtendConnection::FromEntity(l),
+            ExtendConnection::FromEntity(r),
+        ]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    Xor,
+};
+
+Xor: Entity = {
+    <ls:@L> <l:Xor> "^" <r:BitAnd> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::Xor))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Bits)
+        .with(InferExtending(vec![
+            ExtendConnection::FromEntity(l),
+            ExtendConnection::FromEntity(r),
+        ]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    BitAnd,
+};
+
+BitAnd: Entity = {
+    <ls:@L> <l:BitAnd> "&" <r:Shift> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::BitAnd))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Bits)
+        .with(InferExtending(vec![
+            // TODO Only needs to extend if BOTH need to extend.
+            ExtendConnection::FromEntity(l),
+            ExtendConnection::FromEntity(r),
+        ]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    Shift,
+};
+
+Shift: Entity = {
+    <ls:@L> <l:Shift> "<<" <r:AddSub> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        // No need to extend either side, since the rhs automatically gets
+        // truncated per the spec, and the left hand side upper bits only get
+        // shifted away further up, causing a very likely need for extending
+        // afterwards (which for now we just always do). So the extension
+        // afterwards gets us back to the exact same result as doing it before
+        // as well.
+        .with(bin_op(l, r, Op::LShift))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Int)
+        .with(NeedsExtending)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> <l:Shift> ">>" <r:AddSub> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(CodeGenDesc(vec![
+            Op::Entity(l),
+            Op::Extend(l),
+            Op::Entity(r),
+            // No need to extend this, since shift counts automatically get
+            // truncated properly
+            Op::RShift,
+        ]))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Int)
+        .with(InferExtending(vec![ExtendConnection::FromEntity(l)]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    AddSub,
+};
+
+AddSub: Entity = {
+    <ls:@L> <l:AddSub> "+" <r:Factor> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::Add))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Number)
+        .with(NeedsExtending)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> <l:AddSub> "-" <r:Factor> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op_extend(l, r, Op::Sub))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Number)
+        .with(NeedsExtending)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    Factor,
+};
+
+Factor: Entity = {
+    <ls:@L> <l:Factor> "*" <r:Cast> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op(l, r, Op::Mul))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Number)
+        .with(NeedsExtending)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    <ls:@L> <l:Factor> "/" <r:Cast> <rs:@R> => world.create_entity()
+        .with(Children(vec![l, r]))
+        .with(bin_op_extend(l, r, Op::Div))
+        .with(TypeChecking(vec![
+            Inference::SameAsMe(l),
+            Inference::SameAsMe(r),
+        ]))
+        .with(Ty::Number)
+        .with(SrcByteRange(ls, rs))
+        .build(),
+
+    Cast,
+};
+
+Cast: Entity = {
+    <ls:@L> <val:Cast> "as" <ty:Ty> <rs:@R> => {
+        let mut builder = world.create_entity()
+        .with(Children(vec![val]))
+        .with(CodeGenDesc(vec![
+            Op::Entity(val),
+            Op::Cast(val),
+        ]))
+        .with(SrcByteRange(ls, rs))
+        .with(TypeChecking(vec![Inference::TypeHint(val)]))
+        .with(NeedsExtending); // TODO Not really always
+
+        if let Some(ty) = ty {
+            builder = builder.with(ty);
+        }
+
+        builder.build()
+    },
+    Unary,
+};
+
+Unary: Entity = {
+    <ls:@L> "!" <val:Term> <rs:@R> => world.create_entity()
+        .with(Children(vec![val]))
+        .with(unary_op(val, Op::Not))
+        .with(Ty::Bits)
+        .with(TypeChecking(vec![Inference::SameAsMe(val)]))
+        .with(InferExtending(vec![ExtendConnection::FromEntity(val)]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    <ls:@L> "-" <val:Term> <rs:@R> => world.create_entity()
+        .with(Children(vec![val]))
+        .with(unary_op(val, Op::Neg))
+        .with(TypeChecking(vec![Inference::SameAsMe(val)]))
+        .with(Ty::Number)
+        .with(InferExtending(vec![ExtendConnection::FromEntity(val)]))
+        .with(SrcByteRange(ls, rs))
+        .build(),
+    Term,
+};
+
+Term: Entity = {
+    <l:@L> <var:Ident> <r:@R> => world.create_entity()
+        .with(VarNames(vec![var]))
+        .with(TypeChecking(vec![Inference::VarSameAsMe(0)]))
+        .with(CodeGenDesc(vec![Op::LoadVar(0)]))
+        .with(InferExtending(vec![ExtendConnection::LoadVar(0)]))
+        .with(SrcByteRange(l, r))
+        .with(ReferencesVar(0))
+        .build(),
+    IntLitEntity,
+    FloatLitEntity,
+    BoolLitEntity,
+    Block,
+    StateVar,
+    "(" <expr:Expr> ")" => expr,
+    IfExpr,
+    WhileExpr,
+    ForExpr,
+    MatchExpr,
+    FnCall,
+    // StructLit,
+    TupleLit,
+};
+
+FnCall: Entity = {
+    <l:@L> <name:Ident> <r:@R> <params:FnCallParams> => {
+        let mut children = Vec::new();
+        let mut ops = Vec::new();
+
+        for (param_idx, param) in params.into_iter().enumerate() {
+            let entity = world.create_entity()
+                .with(Children(vec![param]))
+                .with(VarNames(vec![name.clone()]))
+                .with(FunctionParamAsVar {
+                    function_var: 0,
+                    param_idx,
+                })
+                .with(TypeChecking(vec![
+                    Inference::SameAsMe(param),
+                    Inference::VarSameAsMe(1),
+                ]))
+                .with(CodeGenDesc(vec![
+                    Op::Entity(param),
+                ]))
+                .with(InferExtending(vec![
+                    ExtendConnection::FromEntity(param),
+                    ExtendConnection::StoreVar(1),
+                ]))
+                .build();
+
+            children.push(entity);
+            ops.push(Op::Entity(entity));
+        }
+
+        ops.push(Op::Call(0));
+
+        world.create_entity()
+            .with(FunctionCall {
+                arguments: children.len(),
+            })
+            .with(Children(children))
+            .with(VarNames(vec![name]))
+            .with(TypeChecking(vec![Inference::VarSameAsMe(0)]))
+            .with(InferExtending(vec![ExtendConnection::LoadVar(0)]))
+            .with(SrcByteRange(l, r))
+            .with(CodeGenDesc(ops))
+            .with(ReferencesVar(0))
+            .build()
+    },
+};
+
+FnCallParams: Vec<Entity> = {
+    "(" ")" => Vec::new(),
+    "(" <params:FnCallParamsInner> ","? ")" => params,
+};
+
+FnCallParamsInner: Vec<Entity> = {
+    <params:FnCallParamsInner> "," <param:Expr> => {
+        let mut params = params;
+        params.push(param);
+        params
+    },
+    <param:Expr> => vec![param],
+};
+
+IfExpr: Entity = {
+    <ls:@L> "if" <cond:Expr> <then:Block> "else" <els:Else> <rs:@R> => {
+        let cond_expr = world.create_entity()
+            .with(Children(vec![cond]))
+            .with(TypeChecking(vec![Inference::SameAsMe(cond)]))
+            .with(Ty::Bool)
+            .with(CodeGenDesc(vec![Op::Entity(cond)]))
+            .build();
+
+        world
+            .create_entity()
+            .with(Children(vec![cond_expr, then, els]))
+            .with(TypeChecking(vec![
+                Inference::SameAsMe(then),
+                Inference::SameAsMe(els),
+            ]))
+            .with(CodeGenDesc(vec![
+                Op::Entity(cond_expr),
+                Op::If,
+                Op::Entity(then),
+                Op::Else,
+                Op::Entity(els),
+                Op::End,
+            ]))
+            .with(InferExtending(vec![
+                ExtendConnection::FromEntity(then),
+                ExtendConnection::FromEntity(els),
+            ]))
+            .with(SrcByteRange(ls, rs))
+            .build()
+    },
+
+    <ls:@L> "if" <cond:Expr> <then:Block> <rs:@R> => {
+        let cond_expr = world.create_entity()
+            .with(Children(vec![cond]))
+            .with(TypeChecking(vec![Inference::SameAsMe(cond)]))
+            .with(Ty::Bool)
+            .with(CodeGenDesc(vec![Op::Entity(cond)]))
+            .build();
+
+        world
+            .create_entity()
+            .with(Children(vec![cond_expr, then]))
+            .with(TypeChecking(vec![Inference::SameAsMe(then)]))
+            .with(CodeGenDesc(vec![
+                Op::Entity(cond_expr),
+                Op::If,
+                Op::Entity(then),
+                Op::End,
+            ]))
+            .with(Ty::Unit)
+            .with(InferExtending(vec![ExtendConnection::FromEntity(then)]))
+            .with(SrcByteRange(ls, rs))
+            .build()
+    },
+};
+
+Else: Entity = {
+    IfExpr,
+    Block,
+};
+
+ForExpr: Entity = {
+    "for" <l:@L> <counter:Ident> <r:@R> "in" <iter:IntoIter>  <then:Block> => {
+        let (from, to, is_inclusive) = iter;
+
+        let cached_to = world
+            .create_entity()
+            .build();
+
+        let header = world.create_entity()
+            .with(Children(vec![from, to]))
+            .with(Vars(vec![cached_to]))
+            .with(VarNames(vec![counter.clone()]))
+            .with(VarDecl(0))
+            .with(ReferencesVar(1))
+            .with(TypeChecking(vec![
+                Inference::SameAsMe(from),
+                Inference::VarSameAsMe(1),
+                Inference::SameAsMe(to),
+                Inference::VarSameAsMe(0),
+            ]))
+            .with(Ty::Int)
+            .with(CodeGenDesc(vec![
+                Op::Entity(from),
+                Op::Extend(from),
+                Op::StoreVar(1),
+                Op::Entity(to),
+                Op::Extend(to),
+                Op::StoreVar(0),
+            ]))
+            .with(SrcByteRange(l, r))
+            .build();
+
+        let check_counter = world.create_entity()
+            .with(Vars(vec![cached_to]))
+            .with(VarNames(vec![counter.clone()]))
+            .with(TypeChecking(vec![
+                Inference::VarSameAsMe(1),
+                Inference::VarSameAsMe(0),
+            ]))
+            .with(CodeGenDesc(vec![
+                Op::LoadVar(1),
+                Op::LoadVar(0),
+                if is_inclusive { Op::Gt } else { Op::Ge },
+                Op::BrIf(1),
+            ]))
+            .build();
+
+        let inc_counter = world.create_entity()
+            .with(VarNames(vec![counter]))
+            .with(TypeChecking(vec![Inference::VarSameAsMe(0)]))
+            .with(CodeGenDesc(vec![
+                Op::LoadVar(0),
+                Op::ConstInt(1),
+                Op::Add,
+                Op::StoreVar(0),
+            ]))
+            .build();
+
+        world
+            .create_entity()
+            .with(Scoped)
+            .with(Children(vec![header, check_counter, then, inc_counter]))
+            .with(TypeChecking(vec![Inference::SameAsMe(then)]))
+            .with(Ty::Unit)
+            .with(CodeGenDesc(vec![
+                Op::Entity(header),
+                Op::Block,
+                Op::Loop,
+                Op::Entity(check_counter),
+                Op::Entity(then),
+                Op::Entity(inc_counter),
+                Op::Br(0),
+                Op::End,
+                Op::End,
+            ]))
+            .build()
+    },
+};
+
+IntoIter: (Entity, Entity, bool) = {
+    <from:Expr> ".." <to:Expr> => (from, to, false),
+    <from:Expr> ".." "=" <to:Expr> => (from, to, true),
+};
+
+WhileExpr: Entity = {
+    <ls:@L> "while" <cond:Expr> <rs:@R> <then:Block> => {
+        let cond_expr = world
+            .create_entity()
+            .with(Children(vec![cond]))
+            .with(TypeChecking(vec![Inference::SameAsMe(cond)]))
+            .with(Ty::Bool)
+            .with(CodeGenDesc(vec![
+                Op::Entity(cond),
+                Op::Not,
+                Op::BrIf(1),
+            ]))
+            .with(SrcByteRange(ls, rs))
+            .build();
+
+        world
+            .create_entity()
+            .with(Children(vec![cond_expr, then]))
+            .with(TypeChecking(vec![Inference::SameAsMe(then)]))
+            .with(Ty::Unit)
+            .with(CodeGenDesc(vec![
+                Op::Block,
+                Op::Loop,
+                Op::Entity(cond_expr),
+                Op::Entity(then),
+                Op::Br(0),
+                Op::End,
+                Op::End,
+            ]))
+            .build()
+    },
+};
+
+MatchExpr: Entity = {
+    <ls:@L> "match" <expr:Expr> "{" <cases:MatchCases> "}" <rs:@R> => {
+        let cached_expr = world
+            .create_entity()
+            .build();
+
+        let store_expr = world
+            .create_entity()
+            .with(Children(vec![expr]))
+            .with(Vars(vec![cached_expr]))
+            .with(TypeChecking(vec![
+                Inference::VarSameAsMe(0),
+                Inference::SameAsMe(expr),
+            ]))
+            .with(Ty::Int)
+            .with(CodeGenDesc(vec![
+                Op::Entity(expr),
+                Op::Extend(expr),
+                Op::StoreVar(0),
+            ]))
+            .build();
+
+        let mut outer_ops = vec![
+            Op::Entity(store_expr),
+        ];
+        let mut end_count = 0;
+
+        for case in &cases {
+            if let Some(terms) = &case.pattern {
+                let mut pattern_desc = Vec::new();
+
+                for term in terms {
+                    let desc = match term {
+                        ast::PatternTerm::Int(val) => vec![
+                            Op::LoadVar(0),
+                            Op::ConstInt(*val),
+                            Op::Eq,
+                        ],
+                        ast::PatternTerm::Range(from, to, inclusive) => vec![
+                            Op::LoadVar(0),
+                            Op::ConstInt(*from),
+                            Op::Ge,
+                            Op::LoadVar(0),
+                            Op::ConstInt(*to),
+                            if *inclusive { Op::Le } else { Op::Lt },
+                            Op::BoolAnd,
+                        ],
+                    };
+
+                    let term_entity = world
+                        .create_entity()
+                        .with(Vars(vec![cached_expr]))
+                        .with(TypeChecking(vec![Inference::VarSameAsMe(0)]))
+                        .with(Ty::Int)
+                        .with(CodeGenDesc(desc))
+                        .build();
+
+                    let is_first = pattern_desc.is_empty();
+                    pattern_desc.push(Op::Entity(term_entity));
+                    if !is_first {
+                        pattern_desc.push(Op::BoolOr);
+                    }
+                }
+
+                let pattern_check = world
+                    .create_entity()
+                    .with(Ty::Bool)
+                    .with(CodeGenDesc(pattern_desc))
+                    .build();
+
+                let mut ops = Vec::new();
+                if end_count > 0 {
+                    ops.push(Op::Else);
+                }
+                ops.push(Op::Entity(pattern_check));
+                ops.push(Op::If);
+                ops.push(Op::Entity(case.expr));
+
+                let case = world
+                    .create_entity()
+                    .with(Children(vec![case.expr]))
+                    .with(TypeChecking(vec![Inference::SameAsMe(case.expr)]))
+                    .with(CodeGenDesc(ops))
+                    .build();
+
+                outer_ops.push(Op::Entity(case));
+
+                end_count += 1;
+            }
+        }
+
+        let mut else_cases = cases.iter().filter(|c| c.pattern.is_none());
+        let else_case = else_cases
+            .next()
+            .expect("Match expressions need to have at least one _ pattern");
+        if else_cases.next().is_some() {
+            panic!("There can only be one _ pattern");
+        }
+
+        if end_count > 0 {
+            outer_ops.push(Op::Else);
+        }
+
+        outer_ops.push(Op::Entity(else_case.expr));
+
+        for _ in 0..end_count {
+            outer_ops.push(Op::End);
+        }
+
+        let mut children = cases.iter().map(|c| c.expr).collect::<Vec<_>>();
+        children.push(store_expr);
+
+        world
+            .create_entity()
+            .with(Scoped)
+            .with(Children(children))
+            .with(TypeChecking(cases.iter().map(|c| Inference::SameAsMe(c.expr)).collect()))
+            .with(InferExtending(cases.iter().map(|c| ExtendConnection::FromEntity(c.expr)).collect()))
+            .with(CodeGenDesc(outer_ops))
+            .with(SrcByteRange(ls, rs))
+            .build()
+    },
+};
+
+MatchCases: Vec<ast::MatchCase> = {
+    <cases:MatchCases> <case:MatchCase> => {
+        let mut cases = cases;
+        cases.push(case);
+        cases
+    },
+    <case:MatchCase> => vec![case],
+};
+
+MatchCase: ast::MatchCase = {
+    <pattern:MaybePattern> "=>" <expr:MatchCaseExpr> => ast::MatchCase { pattern, expr },
+};
+
+MatchCaseExpr: Entity = {
+    Block,
+    <expr:Expr> "," => expr,
+};
+
+MaybePattern: Option<Vec<ast::PatternTerm>> = {
+    "_" => None,
+    <pattern:Pattern> => Some(pattern),
+};
+
+Pattern: Vec<ast::PatternTerm> = {
+    <pattern:Pattern> "|" <term:PatternTerm> => {
+        let mut pattern = pattern;
+        pattern.push(term);
+        pattern
+    },
+    <term:PatternTerm> => vec![term],
+};
+
+PatternTerm: ast::PatternTerm = {
+    <integer:IntLit> => ast::PatternTerm::Int(integer),
+    <from:IntLit> ".." <to:IntLit> => ast::PatternTerm::Range(from, to, false),
+    <from:IntLit> ".." "=" <to:IntLit> => ast::PatternTerm::Range(from, to, true),
+};
+
+StateVar: Entity = <l:@L> <src:StateVarSource> "." <field:Ident> <r:@R> => world.create_entity()
+    .with(TypeChecking(vec![Inference::StateVarSameAsMe(field.clone())]))
+    .with(CodeGenDesc(vec![Op::StateVar(src, field)]))
+    .with(SrcByteRange(l, r))
+    .build();
+
+StateVarSource: bool = {
+    "current" => true,
+    "old" => false,
+};
+
+StrLit: String = <s:r#"".*""#> => s[1..s.len() - 1].to_owned();
+
+IntLitEntity: Entity = <l:@L> <lit:IntLit> <r:@R> => world.create_entity()
+    .with(CodeGenDesc(vec![Op::ConstInt(lit)]))
+    .with(Ty::Number)
+    .with(SrcByteRange(l, r))
+    .build();
+
+IntLit: i64 = {
+    <s:r"-?[0-9]+"> => i64::from_str(s).unwrap(),
+    <s:r"-?0x[0-9a-fA-F]+"> => {
+        let mut s = s;
+        let factor = if s.starts_with('-') {
+            s = &s[1..];
+            -1
+        } else {
+            1
+        };
+        factor * i64::from_str_radix(&s[2..], 16).unwrap()
+    },
+};
+
+FloatLitEntity: Entity = <l:@L> <lit:FloatLit> <r:@R> => world.create_entity()
+    .with(CodeGenDesc(vec![Op::ConstFloat(lit)]))
+    .with(Ty::Float)
+    .with(SrcByteRange(l, r))
+    .build();
+
+FloatLit: f64 = <s:r"-?[0-9]+\.[0-9]+"> => f64::from_str(s).unwrap();
+
+BoolLitEntity: Entity = <l:@L> <lit:BoolLit> <r:@R> => world.create_entity()
+    .with(CodeGenDesc(vec![Op::ConstBool(lit)]))
+    .with(Ty::Bool)
+    .with(SrcByteRange(l, r))
+    .build();
+
+BoolLit: bool = {
+    "true" => true,
+    "false" => false,
+};
+
+Ident: String = <s:r"[a-zA-Z][a-zA-Z0-9_]*"> => s.to_owned();
+
+Ty: Option<types::Ty> = {
+    "_" => None,
+    <ty:KnownTy> => Some(ty),
+};
+
+KnownTy: types::Ty = {
+    "bool" => types::Ty::Bool,
+    "u8" => types::Ty::U8,
+    "u16" => types::Ty::U16,
+    "u32" => types::Ty::U32,
+    "u64" => types::Ty::U64,
+    "i8" => types::Ty::I8,
+    "i16" => types::Ty::I16,
+    "i32" => types::Ty::I32,
+    "i64" => types::Ty::I64,
+    "f32" => types::Ty::F32,
+    "f64" => types::Ty::F64,
+    "unit" => types::Ty::Unit,
+};
+
+
+// Experimental
+
+// StructLit: Entity = {
+//     // "{" <var:StructVar> "," "}" => world.create_entity().build(),
+//     "{" <var:StructVar> "," <vars:StructVars> ","? "}" => world.create_entity().build(),
+// };
+
+// StructVars: () = {
+//     <vars:StructVars> "," <var:StructVar> => (),
+//     <var:StructVar> => (),
+// };
+
+// StructVar: () = {
+//     <name:Ident> => (),
+//     <name:Ident> ":" <expr:Expr> => (),
+// };
+
+TupleLit: Entity = {
+    // "(" ")" => world.create_entity().build(),
+    // "(" <expr:Expr> "," ")" => world.create_entity().build(),
+    "(" <expr:Expr> "," <exprs:TupleExprs> ","? ")" => world.create_entity().build(),
+};
+
+TupleExprs: () = {
+    <vars:TupleExprs> "," <expr:Expr> => (),
+    <expr:Expr> => (),
+};

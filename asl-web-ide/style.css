@@ -1,0 +1,48 @@
+html, body {
+    height: 100%;
+    width: 100%;
+    margin: 0px;
+    padding: 0px;
+    overflow: hidden;
+    background-color: #353535;
+}
+#aslContainer {
+    grid-column: 1;
+}
+
+#wastContainer {
+    grid-column: 2;
+}
+
+.grid {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    grid-template-columns: auto 50%;
+}
+
+#compile {
+    /* position: absolute; */
+    z-index: 99;
+}
+
+button#compile:hover {
+    background-color: hsla(0, 0%, 100%, 0.1) !important;
+}
+
+button#compile {
+    width: 100%;
+    height: 30px;
+    /* background-color: #252525; */
+    color: #ffffff;
+    cursor: pointer;
+    font-size: 15px;
+    background-color: transparent;
+    border-width: 0px;
+    /* border-width: 1px; */
+    /* border-style: solid; */
+    /* border-color: hsl(0, 0%, 40%); */
+    /* border-image: initial; */
+    font-weight: bold;
+    font-family: 'fira', sans-serif;
+}
