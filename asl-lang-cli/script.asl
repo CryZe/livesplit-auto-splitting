@@ -2,11 +2,12 @@ state("game.exe") {
 }
 
 start {
-    let x = foo(3, 4.0, while false {}, true);
-
-    true
+    let foo: (f32, _) = (7.5, true);
+    let x = (5 as u8, true, foo);
+    okok(5);
+    false
 }
 
-fn foo(a, b, c, d) {
-    a + b == 3
+fn okok(x) {
+
 }

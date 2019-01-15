@@ -4,8 +4,11 @@ use debug_info::SrcByteRange;
 use error::{RangeError, RangeResult, ResultExt};
 use name_resolution::Vars;
 use specs::prelude::*;
+use specs::storage::GenericReadStorage;
+use std::sync::Arc;
+use std::sync::RwLock;
 
-#[derive(Debug, Clone, PartialEq, Eq, Component)]
+#[derive(Debug, Clone, PartialEq, Component)]
 pub enum Ty {
     Unit,
     Bool,
@@ -23,6 +26,25 @@ pub enum Ty {
     Float,
     Number,
     Bits, // TODO Consider general union types
+    Tuple(Tuple),
+}
+
+#[derive(Debug, Clone)]
+pub struct Tuple(pub Arc<RwLock<Vec<Option<Ty>>>>);
+
+impl Tuple {
+    pub fn new_count(count: usize) -> Self {
+        Tuple(Arc::new(RwLock::new(vec![None; count])))
+    }
+    pub fn new(tys: Vec<Option<Ty>>) -> Self {
+        Tuple(Arc::new(RwLock::new(tys)))
+    }
+}
+
+impl PartialEq for Tuple {
+    fn eq(&self, other: &Tuple) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Component)]
@@ -33,6 +55,7 @@ pub enum Inference {
     VarSameAsMe(usize),
     StateVarSameAsMe(String),
     TypeHint(Entity),
+    SameAsField(usize, Entity),
 }
 
 pub struct TypeSystem<'s> {
@@ -112,7 +135,7 @@ fn apply_hints(
                 if let Inference::TypeHint(other) = inference {
                     let set = {
                         let other_ty = types.get(*other);
-                        if let Ok(Some(_)) = spread(other_ty, Some(&my_ty), &mut is_dirty) {
+                        if let Ok(Some(_)) = spread(other_ty, Some(&my_ty), &mut is_dirty, &types) {
                             true
                         } else {
                             false
@@ -146,7 +169,7 @@ fn run_once(
             match inference {
                 Inference::SameAsMe(other) => {
                     let other_ty = types.get(*other);
-                    if let Some(ty) = spread(my_ty.as_ref(), other_ty, &mut inner_is_dirty)
+                    if let Some(ty) = spread(my_ty.as_ref(), other_ty, &mut inner_is_dirty, &types)
                         .with_entity_range(me, ranges)?
                     {
                         my_ty = Some(ty.clone());
@@ -155,7 +178,7 @@ fn run_once(
                 Inference::VarSameAsMe(var_id) => {
                     let var = vars.get(me).unwrap().0[*var_id];
                     let other_ty = types.get(var);
-                    if let Some(ty) = spread(my_ty.as_ref(), other_ty, &mut inner_is_dirty)
+                    if let Some(ty) = spread(my_ty.as_ref(), other_ty, &mut inner_is_dirty, &types)
                         .with_entity_range(me, ranges)?
                     {
                         my_ty = Some(ty.clone());
@@ -163,10 +186,28 @@ fn run_once(
                 }
                 Inference::StateVarSameAsMe(field_name) => {
                     let path = state.lookup(field_name).with_entity_range(me, ranges)?;
-                    if let Some(ty) = spread(my_ty.as_ref(), Some(&path.ty), &mut inner_is_dirty)
-                        .with_entity_range(me, ranges)?
+                    if let Some(ty) =
+                        spread(my_ty.as_ref(), Some(&path.ty), &mut inner_is_dirty, &types)
+                            .with_entity_range(me, ranges)?
                     {
                         my_ty = Some(ty.clone());
+                    }
+                }
+                Inference::SameAsField(field_idx, other) => {
+                    // TODO Maybe do this outside of the loop so we don't need
+                    // to lock the fields all the time.
+                    // TODO Probably should infer unknown type to tuple too.
+                    // Would error out on "Not a tuple".
+                    let mut my_fields = match &mut my_ty {
+                        Some(Ty::Tuple(Tuple(fields))) => fields.write().unwrap(),
+                        _ => panic!("Not a tuple"),
+                    };
+                    let other_ty = types.get(*other);
+                    let my_ty = &mut my_fields[*field_idx];
+                    if let Some(ty) = spread(my_ty.as_ref(), other_ty, &mut inner_is_dirty, &types)
+                        .with_entity_range(me, ranges)?
+                    {
+                        *my_ty = Some(ty.clone());
                     }
                 }
                 Inference::TypeHint(_) => {
@@ -190,6 +231,15 @@ fn run_once(
                         Inference::StateVarSameAsMe(_) => {
                             // No need to back propagate to a state
                             // variable, as it already is fully typed.
+                        }
+                        Inference::SameAsField(field_idx, other) => {
+                            let my_fields = match &my_ty {
+                                Ty::Tuple(Tuple(fields)) => fields.read().unwrap(),
+                                _ => unreachable!(),
+                            };
+                            if let Some(my_ty) = &my_fields[*field_idx] {
+                                let _ = types.insert(*other, my_ty.clone());
+                            }
                         }
                         Inference::TypeHint(_) => {
                             // Same as above, we don't do type hinting during
@@ -218,13 +268,19 @@ impl<'a> System<'a> for CheckForUnassignedTypes {
     }
 }
 
-fn inner_spread<'a>(a: Option<&Ty>, b: Option<&'a Ty>) -> RangeResult<Option<&'a Ty>> {
+fn inner_spread<'a>(
+    a: Option<&Ty>,
+    b: Option<&'a Ty>,
+    is_dirty: &mut bool,
+    types: &WriteStorage<Ty>,
+) -> RangeResult<Option<&'a Ty>> {
     let (a, b) = match (a, b) {
         (Some(a), Some(b)) => (a, b),
         (None, Some(a)) => return Ok(Some(a)),
         _ => return Ok(None),
     };
     Ok(match (a, b) {
+        (a, b) if a == b => None,
         (Ty::Int, x) if x.is_specific_int() => Some(x),
         (Ty::Float, x) if x.is_specific_float() => Some(x),
         (Ty::Number, x) if x.is_more_specific_number() => Some(x),
@@ -234,11 +290,20 @@ fn inner_spread<'a>(a: Option<&Ty>, b: Option<&'a Ty>) -> RangeResult<Option<&'a
         (x, Ty::Float) if x.is_specific_float() => None,
         (x, Ty::Number) if x.is_more_specific_number() => None,
         (x, Ty::Bits) if x.is_more_specific_bits_type() => None,
-        (a, b) if a == b => None,
+        (Ty::Tuple(Tuple(x)), Ty::Tuple(Tuple(y))) => {
+            // TODO Recursive types (that's the unwrap)
+            // TODO todo zip_exact or something like that
+            for (a, b) in x.write().unwrap().iter_mut().zip(y.read().unwrap().iter()) {
+                if spread(a.as_ref(), b.as_ref(), is_dirty, types)?.is_some() {
+                    *a = b.clone();
+                }
+            }
+            None
+        }
         _ => {
             return Err(RangeError::new(format!(
                 "Type conflict between {} and {}",
-                a, b
+                a, b,
             )))
         }
     })
@@ -248,8 +313,9 @@ fn spread<'a>(
     a: Option<&Ty>,
     b: Option<&'a Ty>,
     is_dirty: &mut bool,
+    types: &WriteStorage<Ty>,
 ) -> RangeResult<Option<&'a Ty>> {
-    let new_val = inner_spread(a, b)?;
+    let new_val = inner_spread(a, b, is_dirty, types)?;
     *is_dirty |= a != b;
     Ok(new_val)
 }
@@ -317,6 +383,20 @@ impl fmt::Display for Ty {
             Ty::Float => write!(f, "{{float}}"),
             Ty::Number => write!(f, "{{number}}"),
             Ty::Bits => write!(f, "{{bits}}"),
+            Ty::Tuple(t) => {
+                write!(f, "(")?;
+                for (i, ty) in t.0.read().unwrap().iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    if let Some(ty) = ty {
+                        write!(f, "{}", ty)?;
+                    } else {
+                        write!(f, "_")?;
+                    }
+                }
+                write!(f, ")")
+            }
         }
     }
 }

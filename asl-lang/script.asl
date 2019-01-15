@@ -4,15 +4,18 @@ state("bgb.exe") {
 }
 
 start {
-    let a: u16 = 2345;
+    let a = 2345;
     let b: u32 = 567;
-    let eq = a as u8 < b as _;
+    let eq = a < b as _;
 
     let c = a as u8;
     let d = c + c;
     let e = d - d;
 
     let okokok: i64 = 257 << 3;
+
+    let lul = 234;
+    let lmao: (i16, _, u8, _, f64) = (lul, 2 & lul, 3, true, 3 + 1);
 
     {} == {};
 
@@ -26,19 +29,19 @@ start {
         }
     };
 
-    let isOnSpot = current.x == 7 && current.y == 1;
-    let wasOnSpot = old.x == 7 && old.y == 1;
-    isOnSpot && !wasOnSpot
+    enteredSpot(7, 1)
 }
 
 split {
-    let isOnSpot = current.x == 5 && current.y == 1;
-    let wasOnSpot = old.x == 5 && old.y == 1;
-    isOnSpot && !wasOnSpot
+    enteredSpot(5, 1)
 }
 
 reset {
-    let isOnSpot = current.x == 3 && current.y == 2;
-    let wasOnSpot = old.x == 3 && old.y == 2;
+    enteredSpot(3, 2)
+}
+
+fn enteredSpot(x, y) {
+    let isOnSpot = current.x == x && current.y == y;
+    let wasOnSpot = old.x == x && old.y == y;
     isOnSpot && !wasOnSpot
 }

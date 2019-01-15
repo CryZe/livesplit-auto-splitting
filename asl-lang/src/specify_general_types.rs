@@ -12,12 +12,21 @@ impl<'a> System<'a> for SpecifyGeneralTypes {
         // either be integrated into the type inference or be a pre-pass. So
         // this will always have to stay this simple.
         for ty in (&mut types).join() {
-            match ty {
-                Ty::Int | Ty::Number => *ty = Ty::I32,
-                Ty::Float => *ty = Ty::F64,
-                Ty::Bits => unreachable!("The Bits type shouldn't get past the type inference"),
-                _ => {}
+            process_ty(ty);
+        }
+    }
+}
+
+fn process_ty(ty: &mut Ty) {
+    match ty {
+        Ty::Int | Ty::Number => *ty = Ty::I32,
+        Ty::Float => *ty = Ty::F64,
+        Ty::Bits => unreachable!("The Bits type shouldn't get past the type inference"),
+        Ty::Tuple(tuple) => {
+            for ty in tuple.0.write().unwrap().iter_mut().flatten() {
+                process_ty(ty);
             }
         }
+        _ => {}
     }
 }

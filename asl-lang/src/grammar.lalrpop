@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use code_gen::{Op, CodeGenDesc};
 use name_resolution::{DeclaredBy, VarNames, VarDecl, Vars, FunctionParamAsVar};
-use types::{self, Inference, TypeChecking, Ty};
+use types::{self, Inference, TypeChecking, Ty, Tuple};
 use ast::{self, Children, Scoped};
 use specs::prelude::*;
 use ops::{unary_op, bin_op, bin_op_extend, build_compare, build_op_assign, build_action, build_fn};
@@ -21,7 +21,7 @@ Item: ast::Item = {
 
 State: ast::State = "state" "(" <process:StrLit> ")" "{" <paths:PointerPath*> "}" => ast::State { process, paths };
 
-PointerPath: ast::PointerPath = <name:Ident> ":" <ty:KnownTy> "=" <module:StrLit> "," <offsets:Offsets> ";" => ast::PointerPath {
+PointerPath: ast::PointerPath = <name:Ident> ":" <ty:PointerPathTy> "=" <module:StrLit> "," <offsets:Offsets> ";" => ast::PointerPath {
     name,
     ty,
     module,
@@ -936,24 +936,38 @@ BoolLit: bool = {
 
 Ident: String = <s:r"[a-zA-Z][a-zA-Z0-9_]*"> => s.to_owned();
 
-Ty: Option<types::Ty> = {
+Ty: Option<Ty> = {
     "_" => None,
-    <ty:KnownTy> => Some(ty),
+    "(" <ty:Ty> "," <tys:TupleTy> ","? ")" => {
+        let mut tys = tys;
+        tys.insert(0, ty);
+        Some(Ty::Tuple(Tuple::new(tys)))
+    },
+    <ty:PointerPathTy> => Some(ty),
 };
 
-KnownTy: types::Ty = {
-    "bool" => types::Ty::Bool,
-    "u8" => types::Ty::U8,
-    "u16" => types::Ty::U16,
-    "u32" => types::Ty::U32,
-    "u64" => types::Ty::U64,
-    "i8" => types::Ty::I8,
-    "i16" => types::Ty::I16,
-    "i32" => types::Ty::I32,
-    "i64" => types::Ty::I64,
-    "f32" => types::Ty::F32,
-    "f64" => types::Ty::F64,
-    "unit" => types::Ty::Unit,
+TupleTy: Vec<Option<Ty>> = {
+    <tys:TupleTy> "," <ty:Ty> => {
+        let mut tys = tys;
+        tys.push(ty);
+        tys
+    },
+    <ty:Ty> => vec![ty],
+};
+
+PointerPathTy: Ty = {
+    "bool" => Ty::Bool,
+    "u8" => Ty::U8,
+    "u16" => Ty::U16,
+    "u32" => Ty::U32,
+    "u64" => Ty::U64,
+    "i8" => Ty::I8,
+    "i16" => Ty::I16,
+    "i32" => Ty::I32,
+    "i64" => Ty::I64,
+    "f32" => Ty::F32,
+    "f64" => Ty::F64,
+    "unit" => Ty::Unit,
 };
 
 
@@ -977,10 +991,29 @@ KnownTy: types::Ty = {
 TupleLit: Entity = {
     // "(" ")" => world.create_entity().build(),
     // "(" <expr:Expr> "," ")" => world.create_entity().build(),
-    "(" <expr:Expr> "," <exprs:TupleExprs> ","? ")" => world.create_entity().build(),
+    <l:@L> "(" <expr:Expr> "," <exprs:TupleExprs> ","? ")" <r:@R> => {
+        let mut exprs = exprs;
+        exprs.insert(0, expr);
+
+        world.create_entity()
+            .with(Ty::Tuple(Tuple::new_count(exprs.len())))
+            .with(TypeChecking(
+                exprs.iter().cloned().enumerate().map(|(i, expr)| Inference::SameAsField(i, expr)).collect()
+            ))
+            .with(CodeGenDesc(
+                exprs.iter().cloned().map(Op::Entity).collect()
+            ))
+            .with(Children(exprs))
+            .with(SrcByteRange(l, r))
+            .build()
+    },
 };
 
-TupleExprs: () = {
-    <vars:TupleExprs> "," <expr:Expr> => (),
-    <expr:Expr> => (),
+TupleExprs: Vec<Entity> = {
+    <exprs:TupleExprs> "," <expr:Expr> => {
+        let mut exprs = exprs;
+        exprs.push(expr);
+        exprs
+    },
+    <expr:Expr> => vec![expr],
 };

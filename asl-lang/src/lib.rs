@@ -51,7 +51,7 @@ fn create_world() -> World {
     world.register::<name_resolution::VarNames>();
     world.register::<name_resolution::Vars>();
     world.register::<reg_alloc::FunctionRegisters>();
-    world.register::<reg_alloc::Register>();
+    world.register::<reg_alloc::Registers>();
     world.register::<reg_extend::InferExtending>();
     world.register::<reg_extend::NeedsExtending>();
     world.register::<types::Ty>();

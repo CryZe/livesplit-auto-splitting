@@ -1,10 +1,11 @@
 use winapi::shared::minwindef::{BOOL, DWORD};
 use winapi::um::{
-    handleapi::{CloseHandle, INVALID_HANDLE_VALUE}, memoryapi::ReadProcessMemory,
+    handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+    memoryapi::ReadProcessMemory,
     processthreadsapi::{GetProcessTimes, OpenProcess},
     tlhelp32::{
-        CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
-        Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+        MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPPROCESS,
     },
     winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
 };

@@ -6,7 +6,7 @@ use parity_wasm::{
     builder::{ImportBuilder, ModuleBuilder, SignatureBuilder},
     elements::{BlockType, Instruction, Instructions, Local, Module, ValueType},
 };
-use reg_alloc::{FunctionRegisters, Register};
+use reg_alloc::{FunctionRegisters, Registers};
 use reg_extend::NeedsExtending;
 use specs::prelude::*;
 use types::Ty;
@@ -62,7 +62,7 @@ impl<'a, 's> System<'a> for CodeGen<'s> {
         ReadStorage<'a, CodeGenDesc>,
         ReadStorage<'a, Ty>,
         ReadStorage<'a, Vars>,
-        ReadStorage<'a, Register>,
+        ReadStorage<'a, Registers>,
         ReadStorage<'a, FunctionRegisters>,
         ReadStorage<'a, NeedsExtending>,
         ReadStorage<'a, FunctionIndex>,
@@ -259,7 +259,7 @@ fn build_action(
     codegen_descs: &ReadStorage<CodeGenDesc>,
     types: &ReadStorage<Ty>,
     vars: &ReadStorage<Vars>,
-    registers: &ReadStorage<Register>,
+    registers: &ReadStorage<Registers>,
     function_registers: &ReadStorage<FunctionRegisters>,
     needs_extending: &ReadStorage<NeedsExtending>,
     function_indices: &ReadStorage<FunctionIndex>,
@@ -273,7 +273,8 @@ fn build_action(
         Some(ActionKind::IsLoading) => (Some(ValueType::I32), Some("is_loading"), Vec::new()),
         Some(ActionKind::GameTime) => (Some(ValueType::F64), Some("game_time"), Vec::new()),
         None => (
-            types.get(entity).unwrap().reg_type(),
+            unimplemented!(),
+            // types.get(entity).unwrap().reg_type(),
             None,
             function_signatures.get(entity).unwrap().0.clone(),
         ),
@@ -336,14 +337,13 @@ fn code_gen(
     codegen_descs: &ReadStorage<CodeGenDesc>,
     types: &ReadStorage<Ty>,
     vars: &ReadStorage<Vars>,
-    registers: &ReadStorage<Register>,
+    registers_storage: &ReadStorage<Registers>,
     needs_extending: &ReadStorage<NeedsExtending>,
     function_indices: &ReadStorage<FunctionIndex>,
     entity: Entity,
 ) {
     let desc = codegen_descs.get(entity).unwrap();
     let ty = types.get(entity).unwrap();
-    let reg_ty = ty.reg_type();
     for op in &desc.0 {
         match op {
             Op::Entity(child) => code_gen(
@@ -352,13 +352,13 @@ fn code_gen(
                 codegen_descs,
                 types,
                 vars,
-                registers,
+                registers_storage,
                 needs_extending,
                 function_indices,
                 *child,
             ),
             Op::Add => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Add,
                     ValueType::I64 => Instruction::I64Add,
                     ValueType::F32 => Instruction::F32Add,
@@ -367,7 +367,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Sub => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Sub,
                     ValueType::I64 => Instruction::I64Sub,
                     ValueType::F32 => Instruction::F32Sub,
@@ -376,7 +376,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Mul => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Mul,
                     ValueType::I64 => Instruction::I64Mul,
                     ValueType::F32 => Instruction::F32Mul,
@@ -385,7 +385,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Div => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32DivU,
                     (ValueType::I32, false) => Instruction::I32DivS,
                     (ValueType::I64, true) => Instruction::I64DivU,
@@ -396,7 +396,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::LShift => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Shl,
                     ValueType::I64 => Instruction::I64Shl,
                     _ => unreachable!(),
@@ -404,7 +404,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::RShift => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32ShrU,
                     (ValueType::I32, false) => Instruction::I32ShrS,
                     (ValueType::I64, true) => Instruction::I64ShrU,
@@ -414,7 +414,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Not => {
-                let ins = match (ty, reg_ty.unwrap()) {
+                let ins = match (ty, ty.value_type().unwrap()) {
                     (Ty::Bool, _) => Instruction::I32Eqz,
                     (_, ValueType::I32) => {
                         instructions.push(Instruction::I32Const(!0));
@@ -430,7 +430,7 @@ fn code_gen(
             }
             Op::Neg => {
                 // Negating should work just fine with dirty values.
-                let ins = match reg_ty.expect("Can't negate unit values") {
+                let ins = match ty.value_type().expect("Can't negate unit values") {
                     ValueType::I32 => {
                         instructions.push(Instruction::I32Const(0));
                         Instruction::I32Sub
@@ -447,7 +447,7 @@ fn code_gen(
             Op::BoolOr => instructions.push(Instruction::I32Or),
             Op::BoolAnd => instructions.push(Instruction::I32And),
             Op::BitOr => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Or,
                     ValueType::I64 => Instruction::I64Or,
                     _ => unreachable!(),
@@ -455,7 +455,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::BitAnd => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32And,
                     ValueType::I64 => Instruction::I64And,
                     _ => unreachable!(),
@@ -463,7 +463,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Xor => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Xor,
                     ValueType::I64 => Instruction::I64Xor,
                     _ => unreachable!(),
@@ -471,7 +471,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Eq => {
-                let ins = match reg_ty {
+                let ins = match ty.value_type() {
                     Some(ValueType::I32) => Instruction::I32Eq,
                     Some(ValueType::I64) => Instruction::I64Eq,
                     Some(ValueType::F32) => Instruction::F32Eq,
@@ -481,7 +481,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Ne => {
-                let ins = match reg_ty {
+                let ins = match ty.value_type() {
                     Some(ValueType::I32) => Instruction::I32Ne,
                     Some(ValueType::I64) => Instruction::I64Ne,
                     Some(ValueType::F32) => Instruction::F32Ne,
@@ -491,7 +491,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Gt => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32GtU,
                     (ValueType::I32, false) => Instruction::I32GtS,
                     (ValueType::I64, true) => Instruction::I64GtU,
@@ -502,7 +502,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Ge => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32GeU,
                     (ValueType::I32, false) => Instruction::I32GeS,
                     (ValueType::I64, true) => Instruction::I64GeU,
@@ -513,7 +513,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Lt => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32LtU,
                     (ValueType::I32, false) => Instruction::I32LtS,
                     (ValueType::I64, true) => Instruction::I64LtU,
@@ -524,7 +524,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::Le => {
-                let ins = match (reg_ty.unwrap(), ty.is_uint()) {
+                let ins = match (ty.value_type().unwrap(), ty.is_uint()) {
                     (ValueType::I32, true) => Instruction::I32LeU,
                     (ValueType::I32, false) => Instruction::I32LeS,
                     (ValueType::I64, true) => Instruction::I64LeU,
@@ -535,7 +535,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::ConstInt(val) => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::I32 => Instruction::I32Const(*val as i32),
                     ValueType::I64 => Instruction::I64Const(*val),
                     ValueType::F32 => Instruction::F32Const((*val as f32).to_bits()),
@@ -544,7 +544,7 @@ fn code_gen(
                 instructions.push(ins);
             }
             Op::ConstFloat(val) => {
-                let ins = match reg_ty.unwrap() {
+                let ins = match ty.value_type().unwrap() {
                     ValueType::F32 => Instruction::F32Const((*val as f32).to_bits()),
                     ValueType::F64 => Instruction::F64Const(val.to_bits()),
                     _ => unreachable!(),
@@ -559,14 +559,22 @@ fn code_gen(
             }
             Op::LoadVar(i) => {
                 let var = vars.get(entity).unwrap().0[*i];
-                if let Some(Register(reg)) = registers.get(var) {
-                    instructions.push(Instruction::GetLocal(*reg));
+                if let Some(Registers(registers)) = registers_storage.get(var) {
+                    for register in registers {
+                        if let Some((_, idx)) = register {
+                            instructions.push(Instruction::GetLocal(*idx));
+                        }
+                    }
                 }
             }
             Op::StoreVar(i) => {
                 let var = vars.get(entity).unwrap().0[*i];
-                if let Some(Register(reg)) = registers.get(var) {
-                    instructions.push(Instruction::SetLocal(*reg));
+                if let Some(Registers(registers)) = registers_storage.get(var) {
+                    for register in registers.iter().rev() {
+                        if let Some((_, idx)) = register {
+                            instructions.push(Instruction::SetLocal(*idx));
+                        }
+                    }
                 }
             }
             Op::StateVar(is_current, name) => {
@@ -589,8 +597,8 @@ fn code_gen(
                 instructions.push(Instruction::Call(ins));
             }
             Op::If => {
-                let block_ty = if let Some(reg_ty) = reg_ty {
-                    BlockType::Value(reg_ty)
+                let block_ty = if let Some(val_ty) = ty.value_type() {
+                    BlockType::Value(val_ty)
                 } else {
                     BlockType::NoResult
                 };
@@ -599,16 +607,16 @@ fn code_gen(
             Op::Else => instructions.push(Instruction::Else),
             Op::End => instructions.push(Instruction::End),
             Op::Block => {
-                let block_ty = if let Some(reg_ty) = reg_ty {
-                    BlockType::Value(reg_ty)
+                let block_ty = if let Some(val_ty) = ty.value_type() {
+                    BlockType::Value(val_ty)
                 } else {
                     BlockType::NoResult
                 };
                 instructions.push(Instruction::Block(block_ty));
             }
             Op::Loop => {
-                let block_ty = if let Some(reg_ty) = reg_ty {
-                    BlockType::Value(reg_ty)
+                let block_ty = if let Some(val_ty) = ty.value_type() {
+                    BlockType::Value(val_ty)
                 } else {
                     BlockType::NoResult
                 };

@@ -3,7 +3,7 @@ use error::{RangeError, RangeResult, ResultExt};
 use name_resolution::FunctionDecl;
 use name_resolution::Vars;
 use parity_wasm::elements::ValueType;
-use reg_alloc::Register;
+use reg_alloc::Registers;
 use specs::prelude::*;
 use types::Ty;
 
@@ -25,24 +25,28 @@ impl<'a> System<'a> for AllocFunctionSignatureRegisters {
         ReadStorage<'a, FunctionDecl>,
         ReadStorage<'a, Ty>,
         WriteStorage<'a, FunctionSignatureRegisters>,
-        WriteStorage<'a, Register>,
+        WriteStorage<'a, Registers>,
         ReadStorage<'a, Vars>,
     );
 
     fn run(
         &mut self,
-        (entities, decls, types, mut signatures, mut registers, vars): Self::SystemData,
+        (entities, decls, types, mut signatures, mut registers_storage, vars): Self::SystemData,
     ) {
         for (entity, FunctionDecl(_, params)) in (&*entities, &decls).join() {
             let mut signature = Vec::new();
             for param in params {
-                if let Some(reg_ty) = types.get(*param).and_then(|t| t.reg_type()) {
+                if let Some(ty) = types.get(*param) {
+                    let mut registers = ty.create_registers_description();
+                    for reg in &mut registers.0 {
+                        if let Some((reg_ty, idx)) = reg {
+                            *idx = signature.len() as u32;
+                            signature.push(*reg_ty);
+                        }
+                    }
                     // Ugly assumption that it's always the first one
                     let var = vars.get(*param).unwrap().0[0];
-                    registers
-                        .insert(var, Register(signature.len() as u32))
-                        .unwrap();
-                    signature.push(reg_ty);
+                    registers_storage.insert(var, registers).unwrap();
                 }
             }
             signatures

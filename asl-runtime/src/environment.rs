@@ -88,11 +88,11 @@ impl Externals for Environment {
                 let len: u32 = args.nth_checked(1)?;
                 let len = len as usize;
 
-                self.process_name = self.memory
+                self.process_name = self
+                    .memory
                     .with_direct_access(|m| {
                         Some(str::from_utf8(m.get(ptr..ptr + len)?).ok()?.to_owned())
-                    })
-                    .ok_or_else(|| {
+                    }).ok_or_else(|| {
                         Trap::new(TrapKind::Host(Box::new(
                             EnvironmentError::InvalidProcessName,
                         )))
@@ -125,11 +125,11 @@ impl Externals for Environment {
                     PointerType::String => PointerValue::String(String::new()),
                 };
 
-                let module_name = self.memory
+                let module_name = self
+                    .memory
                     .with_direct_access(|m| {
                         Some(str::from_utf8(m.get(ptr..ptr + len)?).ok()?.to_owned())
-                    })
-                    .ok_or_else(|| {
+                    }).ok_or_else(|| {
                         Trap::new(TrapKind::Host(Box::new(
                             EnvironmentError::InvalidModuleName,
                         )))
@@ -149,11 +149,12 @@ impl Externals for Environment {
                 let pointer_path_id: u32 = args.nth_checked(0)?;
                 let pointer_path_id = pointer_path_id as usize;
                 let offset: i64 = args.nth_checked(1)?;
-                let pointer_path = self.pointer_paths.get_mut(pointer_path_id).ok_or_else(|| {
-                    Trap::new(TrapKind::Host(Box::new(
-                        EnvironmentError::InvalidPointerPathId,
-                    )))
-                })?;
+                let pointer_path =
+                    self.pointer_paths.get_mut(pointer_path_id).ok_or_else(|| {
+                        Trap::new(TrapKind::Host(Box::new(
+                            EnvironmentError::InvalidPointerPathId,
+                        )))
+                    })?;
                 pointer_path.offsets.push(offset);
                 Ok(None)
             }
